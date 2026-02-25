@@ -166,7 +166,9 @@ export async function run(_args: string[]): Promise<void> {
   }
 
   // Determine overall status — skip WhatsApp auth check when TELEGRAM_ONLY is set
-  const telegramOnly = process.env.TELEGRAM_ONLY === 'true';
+  const envContent2 = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf-8') : '';
+  const telegramOnly =
+    process.env.TELEGRAM_ONLY === 'true' || /^TELEGRAM_ONLY=true$/m.test(envContent2);
   const status =
     service === 'running' &&
     credentials !== 'missing' &&
