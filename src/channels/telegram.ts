@@ -1,4 +1,4 @@
-import { Bot } from 'grammy';
+import { Bot, GrammyError } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { logger } from '../logger.js';
@@ -21,6 +21,8 @@ export class TelegramChannel implements Channel {
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
   private botToken: string;
+  private pollingActive = false;
+  private reconnecting = false;
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
@@ -164,15 +166,26 @@ export class TelegramChannel implements Channel {
     this.bot.on('message:location', (ctx) => storeNonText(ctx, '[Location]'));
     this.bot.on('message:contact', (ctx) => storeNonText(ctx, '[Contact]'));
 
-    // Handle errors gracefully
+    // Handle errors — reconnect on fatal/network errors
     this.bot.catch((err) => {
       logger.error({ err: err.message }, 'Telegram bot error');
+      const isFatal =
+        !(err.error instanceof GrammyError) ||
+        err.error.error_code === 401 ||
+        err.error.error_code === 409 ||
+        err.error.error_code >= 500;
+      if (isFatal) {
+        // 409 = another instance is polling; wait longer for it to die
+        const delay = err.error instanceof GrammyError && err.error.error_code === 409 ? 30000 : 5000;
+        this.reconnect(delay);
+      }
     });
 
     // Start polling — returns a Promise that resolves when started
     return new Promise<void>((resolve) => {
       this.bot!.start({
         onStart: (botInfo) => {
+          this.pollingActive = true;
           logger.info(
             { username: botInfo.username, id: botInfo.id },
             'Telegram bot connected',
@@ -183,8 +196,31 @@ export class TelegramChannel implements Channel {
           );
           resolve();
         },
+      }).catch((err) => {
+        this.pollingActive = false;
+        logger.error({ err }, 'Telegram polling died');
+        this.reconnect();
       });
     });
+  }
+
+  private async reconnect(delayMs = 5000): Promise<void> {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+    this.pollingActive = false;
+    logger.warn({ delayMs }, 'Telegram bot reconnecting...');
+    if (this.bot) {
+      try { this.bot.stop(); } catch {}
+      this.bot = null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    this.reconnecting = false;
+    try {
+      await this.connect();
+    } catch (err) {
+      logger.error({ err }, 'Telegram reconnect failed, retrying in 30s');
+      this.reconnect(30000);
+    }
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
@@ -193,29 +229,45 @@ export class TelegramChannel implements Channel {
       return;
     }
 
-    try {
-      const numericId = jid.replace(/^tg:/, '');
-
-      // Telegram has a 4096 character limit per message — split if needed
-      const MAX_LENGTH = 4096;
-      if (text.length <= MAX_LENGTH) {
-        await this.bot.api.sendMessage(numericId, text);
-      } else {
-        for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await this.bot.api.sendMessage(
-            numericId,
-            text.slice(i, i + MAX_LENGTH),
+    const numericId = jid.replace(/^tg:/, '');
+    const MAX_LENGTH = 4096;
+    const chunks =
+      text.length <= MAX_LENGTH
+        ? [text]
+        : Array.from({ length: Math.ceil(text.length / MAX_LENGTH) }, (_, i) =>
+            text.slice(i * MAX_LENGTH, (i + 1) * MAX_LENGTH),
           );
+
+    for (const chunk of chunks) {
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await this.bot.api.sendMessage(numericId, chunk);
+          lastErr = undefined;
+          break;
+        } catch (err) {
+          lastErr = err;
+          const isTransient =
+            !(err instanceof GrammyError) ||
+            err.error_code === 429 ||
+            err.error_code >= 500;
+          if (!isTransient) break;
+          const delay = err instanceof GrammyError && err.error_code === 429
+            ? ((err.parameters as any)?.retry_after ?? 5) * 1000
+            : 1000 * Math.pow(2, attempt);
+          logger.warn({ jid, attempt, delay }, 'Telegram send failed, retrying');
+          await new Promise((resolve) => setTimeout(resolve, delay));
         }
       }
-      logger.info({ jid, length: text.length }, 'Telegram message sent');
-    } catch (err) {
-      logger.error({ jid, err }, 'Failed to send Telegram message');
+      if (lastErr) {
+        logger.error({ jid, err: lastErr }, 'Failed to send Telegram message');
+      }
     }
+    logger.info({ jid, length: text.length }, 'Telegram message sent');
   }
 
   isConnected(): boolean {
-    return this.bot !== null;
+    return this.bot !== null && this.pollingActive;
   }
 
   ownsJid(jid: string): boolean {
@@ -223,6 +275,8 @@ export class TelegramChannel implements Channel {
   }
 
   async disconnect(): Promise<void> {
+    this.reconnecting = true; // prevent reconnect loop on intentional shutdown
+    this.pollingActive = false;
     if (this.bot) {
       this.bot.stop();
       this.bot = null;

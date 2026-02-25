@@ -447,6 +447,9 @@ async function main(): Promise<void> {
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('unhandledRejection', (reason) => {
+    logger.error({ reason }, 'Unhandled promise rejection');
+  });
 
   // Channel callbacks (shared by all channels)
   const channelOpts = {
