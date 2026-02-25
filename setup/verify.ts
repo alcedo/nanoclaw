@@ -165,7 +165,8 @@ export async function run(_args: string[]): Promise<void> {
     mountAllowlist = 'configured';
   }
 
-  // Determine overall status
+  // Determine overall status — skip WhatsApp auth check when TELEGRAM_ONLY is set
+  const telegramOnly = process.env.TELEGRAM_ONLY === 'true';
   const status =
     service === 'running' &&
     credentials !== 'missing' &&

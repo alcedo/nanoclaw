@@ -103,7 +103,8 @@ export async function run(args: string[]): Promise<void> {
   let buildOk = false;
   logger.info({ runtime }, 'Building container');
   try {
-    execSync(`${buildCmd} -t ${image} .`, {
+    const networkFlag = runtime === 'docker' ? '--network host ' : '';
+    execSync(`${buildCmd} ${networkFlag}-t ${image} .`, {
       cwd: path.join(projectRoot, 'container'),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
