@@ -197,6 +197,17 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Gmail credentials directory
+  const homeDir = process.env.HOME || '/home/bitnami';
+  const gmailDir = path.join(homeDir, '.gmail-mcp');
+  if (fs.existsSync(gmailDir)) {
+    mounts.push({
+      hostPath: gmailDir,
+      containerPath: '/home/node/.gmail-mcp',
+      readonly: false,
+    });
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
