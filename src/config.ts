@@ -5,7 +5,7 @@ import { readEnvFile } from './env.js';
 // Read config values from .env (falls back to process.env).
 // Secrets are NOT read here — they stay on disk and are loaded only
 // where needed (container-runner.ts) to avoid leaking to child processes.
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_ONLY']);
+const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_ONLY', 'CONTAINER_MEMORY_LIMIT']);
 
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
@@ -49,7 +49,7 @@ export const MAX_CONCURRENT_CONTAINERS = Math.max(
 
 // Resource limits per container — prevents a runaway agent from OOMing the host
 export const CONTAINER_MEMORY_LIMIT =
-  process.env.CONTAINER_MEMORY_LIMIT || '2g';
+  process.env.CONTAINER_MEMORY_LIMIT || envConfig.CONTAINER_MEMORY_LIMIT || '2g';
 export const CONTAINER_CPU_LIMIT = parseFloat(
   process.env.CONTAINER_CPU_LIMIT || '2.0',
 );
