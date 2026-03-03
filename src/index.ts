@@ -245,11 +245,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
     const reason = output !== 'success' ? output : (streamingError || 'Unknown error');
 
-    // Context limit: clear the session so the next message starts fresh
-    if (reason.includes('context limit') || reason.includes('Model context limit')) {
+    // Context limit or OOM: clear the session so the next message starts fresh
+    const isContextLimit = reason.includes('context limit') || reason.includes('Model context limit');
+    const isOom = reason.includes('ran out of memory');
+    if (isContextLimit || isOom) {
       delete sessions[group.folder];
       deleteSession(group.folder);
-      logger.warn({ group: group.name }, 'Context limit hit — session cleared');
+      logger.warn({ group: group.name, isOom }, 'Session cleared due to context limit or OOM');
       try {
         await channel.sendMessage(chatJid, `_Session memory was full and has been reset. Please send your message again._`);
       } catch { /* non-fatal */ }
