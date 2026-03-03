@@ -249,10 +249,18 @@ function buildContainerArgs(
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
+  // Use host networking so the container can reach services on localhost
+  // (e.g. ANTHROPIC_BASE_URL=http://127.0.0.1:8000)
+  args.push('--network', 'host');
+
   // Resource limits — prevent a runaway container from OOMing the host or
   // consuming all CPU. These are configurable via env vars.
-  args.push('--memory', CONTAINER_MEMORY_LIMIT);
-  args.push('--memory-swap', CONTAINER_MEMORY_LIMIT); // disable swap
+  // Set CONTAINER_MEMORY_LIMIT=0 to disable the memory cap (useful on
+  // low-RAM hosts that rely on swap).
+  if (CONTAINER_MEMORY_LIMIT && CONTAINER_MEMORY_LIMIT !== '0') {
+    args.push('--memory', CONTAINER_MEMORY_LIMIT);
+    args.push('--memory-swap', '-1'); // allow unlimited swap
+  }
   args.push('--cpus', String(CONTAINER_CPU_LIMIT));
   args.push('--pids-limit', String(CONTAINER_PIDS_LIMIT));
   // Prefer killing this container over host processes under memory pressure

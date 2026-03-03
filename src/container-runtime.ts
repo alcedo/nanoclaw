@@ -61,13 +61,13 @@ export function ensureContainerRuntimeRunning(): void {
 }
 
 /** Kill orphaned NanoClaw containers from previous runs. */
-export function cleanupOrphans(): void {
+export function cleanupOrphans(activeNames?: Set<string>): void {
   try {
     const output = execSync(
       `${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`,
       { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
     );
-    const orphans = output.trim().split('\n').filter(Boolean);
+    const orphans = output.trim().split('\n').filter(Boolean).filter((name) => !activeNames?.has(name));
     for (const name of orphans) {
       try {
         execSync(stopContainer(name), { stdio: 'pipe' });

@@ -619,7 +619,7 @@ async function main(): Promise<void> {
   // Only kills containers NOT currently tracked by the queue.
   setInterval(() => {
     const activeNames = queue.getActiveContainerNames();
-    cleanupOrphans();
+    cleanupOrphans(activeNames);
   }, DOCKER_WATCHDOG_INTERVAL);
 
   // Prune old container logs daily to prevent disk fill
