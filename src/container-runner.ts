@@ -7,8 +7,11 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  CONTAINER_CPU_LIMIT,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
+  CONTAINER_MEMORY_LIMIT,
+  CONTAINER_PIDS_LIMIT,
   CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
@@ -166,7 +169,13 @@ function buildVolumeMounts(
   const groupIpcDir = resolveGroupIpcPath(group.folder);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  const inputDir = path.join(groupIpcDir, 'input');
+  fs.mkdirSync(inputDir, { recursive: true });
+  // Wipe stale IPC input files from any previous crashed run so they don't
+  // replay as phantom messages into the new container.
+  for (const f of fs.readdirSync(inputDir)) {
+    try { fs.unlinkSync(path.join(inputDir, f)); } catch { /* ignore */ }
+  }
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -240,6 +249,15 @@ function buildContainerArgs(
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
+  // Resource limits — prevent a runaway container from OOMing the host or
+  // consuming all CPU. These are configurable via env vars.
+  args.push('--memory', CONTAINER_MEMORY_LIMIT);
+  args.push('--memory-swap', CONTAINER_MEMORY_LIMIT); // disable swap
+  args.push('--cpus', String(CONTAINER_CPU_LIMIT));
+  args.push('--pids-limit', String(CONTAINER_PIDS_LIMIT));
+  // Prefer killing this container over host processes under memory pressure
+  args.push('--oom-score-adj', '500');
+
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
@@ -273,6 +291,39 @@ export async function runContainerAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
+
+  // Pre-flight: check available RAM (need at least 512MB free to safely spawn)
+  // fs.readFileSync on /proc/meminfo is a kernel virtual file — effectively zero-cost
+  try {
+    const meminfo = fs.readFileSync('/proc/meminfo', 'utf-8');
+    const match = meminfo.match(/MemAvailable:\s+(\d+)\s+kB/);
+    if (match) {
+      const availableKb = parseInt(match[1], 10);
+      if (availableKb < 524288) { // 512MB
+        logger.error({ group: group.name, availableKb }, 'Low RAM, refusing to spawn container');
+        return { status: 'error', result: null, error: `Insufficient RAM to run agent (${Math.round(availableKb / 1024)}MB free, need 512MB)` };
+      }
+    }
+  } catch { /* non-Linux or unreadable — proceed */ }
+
+  // Pre-flight: check disk space (need at least 500MB free) — async via statfs
+  try {
+    const stat = await fs.promises.statfs(DATA_DIR);
+    const availableKb = Math.floor((stat.bavail * stat.bsize) / 1024);
+    if (availableKb < 512000) {
+      logger.error({ group: group.name, availableKb }, 'Low disk space, refusing to spawn container');
+      return { status: 'error', result: null, error: 'Insufficient disk space to run agent (< 500MB free)' };
+    }
+  } catch { /* non-fatal — proceed anyway */ }
+
+  // Pre-flight: verify container image exists — async
+  const imageExists = await new Promise<boolean>((res) => {
+    exec(`${CONTAINER_RUNTIME_BIN} image inspect ${CONTAINER_IMAGE}`, { timeout: 5000 }, (err) => res(!err));
+  });
+  if (!imageExists) {
+    logger.error({ group: group.name, image: CONTAINER_IMAGE }, 'Container image not found');
+    return { status: 'error', result: null, error: `Container image "${CONTAINER_IMAGE}" not found. Run ./container/build.sh to build it.` };
+  }
 
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
@@ -373,7 +424,10 @@ export async function runContainerAgent(
             resetTimeout();
             // Call onOutput for all markers (including null results)
             // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
+            // Catch errors so a failed send doesn't break the chain and hang resolve().
+            outputChain = outputChain.then(() => onOutput(parsed)).catch((err) => {
+              logger.warn({ group: group.name, error: err }, 'onOutput callback error (non-fatal)');
+            });
           } catch (err) {
             logger.warn(
               { group: group.name, error: err },
@@ -548,6 +602,7 @@ export async function runContainerAgent(
       logger.debug({ logFile, verbose: isVerbose }, 'Container log written');
 
       if (code !== 0) {
+        const isOomKill = code === 137;
         logger.error(
           {
             group: group.name,
@@ -557,13 +612,15 @@ export async function runContainerAgent(
             stdout,
             logFile,
           },
-          'Container exited with error',
+          isOomKill ? 'Container OOM killed (exit 137)' : 'Container exited with error',
         );
 
         resolve({
           status: 'error',
           result: null,
-          error: `Container exited with code ${code}: ${stderr.slice(-200)}`,
+          error: isOomKill
+            ? `Container ran out of memory (limit: ${CONTAINER_MEMORY_LIMIT})`
+            : `Container exited with code ${code}: ${stderr.slice(-200)}`,
         });
         return;
       }

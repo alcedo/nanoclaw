@@ -1,10 +1,13 @@
-import { execSync } from 'child_process';
+import { exec } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 import {
   ASSISTANT_NAME,
   DATA_DIR,
+  DOCKER_WATCHDOG_INTERVAL,
+  GROUPS_DIR,
+  HEARTBEAT_INTERVAL,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
   TELEGRAM_BOT_TOKEN,
@@ -29,6 +32,7 @@ import {
 import {
   getAllChats,
   getAllRegisteredGroups,
+  deleteSession,
   getAllSessions,
   getAllTasks,
   getMessagesSince,
@@ -186,6 +190,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
+  // Heartbeat: if no output after HEARTBEAT_INTERVAL, let the user know we're still working.
+  // Cap at 3 messages to avoid spamming on very long requests.
+  let heartbeatCount = 0;
+  const MAX_HEARTBEATS = 3;
+  const heartbeat = setInterval(async () => {
+    if (!outputSentToUser && heartbeatCount < MAX_HEARTBEATS) {
+      heartbeatCount++;
+      const elapsed = Math.round((heartbeatCount * HEARTBEAT_INTERVAL) / 1000);
+      try {
+        await channel.sendMessage(chatJid, `_Still working... (${elapsed}s)_`);
+      } catch { /* non-fatal */ }
+    }
+  }, HEARTBEAT_INTERVAL);
+
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.result) {
@@ -209,12 +227,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
+  clearInterval(heartbeat);
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
-  if (output === 'error' || hadError) {
-    // If we already sent output to the user, don't roll back the cursor —
-    // the user got their response and re-processing would send duplicates.
+  const isError = output !== 'success' || hadError;
+  if (isError) {
     if (outputSentToUser) {
       logger.warn(
         { group: group.name },
@@ -222,7 +240,23 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
       return true;
     }
-    // Roll back cursor so retries can re-process these messages
+    const reason = output !== 'success' ? output : 'Unknown error';
+
+    // Context limit: clear the session so the next message starts fresh
+    if (reason.includes('context limit') || reason.includes('Model context limit')) {
+      delete sessions[group.folder];
+      deleteSession(group.folder);
+      logger.warn({ group: group.name }, 'Context limit hit — session cleared');
+      try {
+        await channel.sendMessage(chatJid, `_Session memory was full and has been reset. Please send your message again._`);
+      } catch { /* non-fatal */ }
+      // Don't roll back cursor — the messages were seen, just the session was stale
+      return true;
+    }
+
+    try {
+      await channel.sendMessage(chatJid, `_Request failed: ${reason}_`);
+    } catch { /* non-fatal */ }
     lastAgentTimestamp[chatJid] = previousCursor;
     saveState();
     logger.warn(
@@ -305,13 +339,13 @@ async function runAgent(
         { group: group.name, error: output.error },
         'Container agent error',
       );
-      return 'error';
+      return output.error || 'error';
     }
 
     return 'success';
   } catch (err) {
     logger.error({ group: group.name, err }, 'Agent error');
-    return 'error';
+    return err instanceof Error ? err.message : 'error';
   }
 }
 
@@ -409,6 +443,41 @@ async function startMessageLoop(): Promise<void> {
       logger.error({ err }, 'Error in message loop');
     }
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+  }
+}
+
+/**
+ * Delete container log files older than LOG_RETENTION_DAYS from all group log dirs.
+ */
+function pruneOldLogs(): void {
+  const cutoff = Date.now() - LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const searchDirs = [
+    path.join(GROUPS_DIR),
+    path.join(DATA_DIR, '..', 'groups'),
+  ];
+  const seen = new Set<string>();
+  for (const base of searchDirs) {
+    if (!fs.existsSync(base)) continue;
+    for (const group of fs.readdirSync(base)) {
+      const logsDir = path.join(base, group, 'logs');
+      if (seen.has(logsDir) || !fs.existsSync(logsDir)) continue;
+      seen.add(logsDir);
+      let deleted = 0;
+      for (const file of fs.readdirSync(logsDir)) {
+        if (!file.startsWith('container-')) continue;
+        const full = path.join(logsDir, file);
+        try {
+          const { mtimeMs } = fs.statSync(full);
+          if (mtimeMs < cutoff) {
+            fs.unlinkSync(full);
+            deleted++;
+          }
+        } catch { /* ignore */ }
+      }
+      if (deleted > 0) {
+        logger.info({ logsDir, deleted }, 'Pruned old container logs');
+      }
+    }
   }
 }
 
@@ -524,6 +593,46 @@ async function main(): Promise<void> {
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
+
+  // Docker daemon health watchdog — runs async so it never blocks the event loop.
+  // If Docker is unresponsive, exit so systemd restarts cleanly.
+  setInterval(() => {
+    const child = exec('docker info', { timeout: 10000 });
+    child.on('close', (code: number | null) => {
+      if (code !== 0) {
+        logger.error({ code }, 'Docker daemon health check failed — exiting for systemd restart');
+        process.exit(1);
+      }
+    });
+    child.on('error', (err: Error) => {
+      logger.error({ err }, 'Docker daemon health check error — exiting for systemd restart');
+      process.exit(1);
+    });
+  }, DOCKER_WATCHDOG_INTERVAL);
+
+  // Periodic orphan cleanup — catches containers from mid-run crashes that
+  // startup cleanup missed (e.g. container started after last restart).
+  // Only kills containers NOT currently tracked by the queue.
+  setInterval(() => {
+    const activeNames = queue.getActiveContainerNames();
+    cleanupOrphans(activeNames);
+  }, DOCKER_WATCHDOG_INTERVAL);
+
+  // Prune old container logs daily to prevent disk fill
+  pruneOldLogs();
+  setInterval(pruneOldLogs, 24 * 60 * 60 * 1000);
+
+  // Prune dangling Docker images daily — old builds accumulate and fill disk
+  const pruneImages = () => exec('docker image prune -f', { timeout: 30000 }, (err, stdout) => {
+    if (err) {
+      logger.warn({ err }, 'Docker image prune failed (non-fatal)');
+    } else if (stdout.trim()) {
+      logger.info({ output: stdout.trim() }, 'Docker image prune complete');
+    }
+  });
+  pruneImages();
+  setInterval(pruneImages, 24 * 60 * 60 * 1000);
+
   startMessageLoop();
 }
 

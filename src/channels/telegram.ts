@@ -223,6 +223,12 @@ export class TelegramChannel implements Channel {
     }
   }
 
+  private preprocessMarkdown(text: string): string {
+    return text
+      .replace(/\*\*([\s\S]*?)\*\*/g, '*$1*')  // **bold** → *bold*
+      .replace(/__([\s\S]*?)__/g, '*$1*');       // __bold__ → *bold*
+  }
+
   async sendMessage(jid: string, text: string): Promise<void> {
     if (!this.bot) {
       logger.warn('Telegram bot not initialized');
@@ -239,10 +245,23 @@ export class TelegramChannel implements Channel {
           );
 
     for (const chunk of chunks) {
+      const processed = this.preprocessMarkdown(chunk);
       let lastErr: unknown;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          await this.bot.api.sendMessage(numericId, chunk);
+          // Try Markdown first so bold/italic/code renders correctly.
+          // Fall back to plain text if Telegram rejects the formatting
+          // (e.g. unmatched asterisks from agent output).
+          try {
+            await this.bot.api.sendMessage(numericId, processed, { parse_mode: 'Markdown' });
+          } catch (fmtErr) {
+            const isBadFormat = fmtErr instanceof GrammyError && fmtErr.error_code === 400;
+            if (isBadFormat) {
+              await this.bot.api.sendMessage(numericId, processed);
+            } else {
+              throw fmtErr;
+            }
+          }
           lastErr = undefined;
           break;
         } catch (err) {

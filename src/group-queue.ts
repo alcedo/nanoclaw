@@ -135,6 +135,15 @@ export class GroupQueue {
     if (groupFolder) state.groupFolder = groupFolder;
   }
 
+  /** Returns the names of all currently active containers tracked by the queue. */
+  getActiveContainerNames(): Set<string> {
+    const names = new Set<string>();
+    for (const state of this.groups.values()) {
+      if (state.containerName) names.add(state.containerName);
+    }
+    return names;
+  }
+
   /**
    * Mark the container as idle-waiting (finished work, waiting for IPC input).
    * If tasks are pending, preempt the idle container immediately.
