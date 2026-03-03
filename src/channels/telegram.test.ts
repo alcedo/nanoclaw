@@ -25,6 +25,22 @@ type Handler = (...args: any[]) => any;
 const botRef = vi.hoisted(() => ({ current: null as any }));
 
 vi.mock('grammy', () => ({
+  GrammyError: class GrammyError extends Error {
+    error_code: number;
+    description: string;
+    parameters: Record<string, unknown>;
+    method: string;
+    payload: Record<string, unknown>;
+    ok: false = false;
+    constructor(message: string, err: { ok: false; error_code: number; description: string; parameters?: Record<string, unknown> }, method: string, payload: Record<string, unknown>) {
+      super(message);
+      this.error_code = err.error_code;
+      this.description = err.description;
+      this.parameters = err.parameters || {};
+      this.method = method;
+      this.payload = payload;
+    }
+  },
   Bot: class MockBot {
     token: string;
     commandHandlers = new Map<string, Handler>();
@@ -32,8 +48,9 @@ vi.mock('grammy', () => ({
     errorHandler: Handler | null = null;
 
     api = {
-      sendMessage: vi.fn().mockResolvedValue(undefined),
+      sendMessage: vi.fn().mockResolvedValue({ message_id: 42 }),
       sendChatAction: vi.fn().mockResolvedValue(undefined),
+      editMessageText: vi.fn().mockResolvedValue(undefined),
     };
 
     constructor(token: string) {
@@ -696,6 +713,7 @@ describe('TelegramChannel', () => {
       expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
         '100200300',
         'Hello',
+        { parse_mode: 'Markdown' },
       );
     });
 
@@ -709,6 +727,7 @@ describe('TelegramChannel', () => {
       expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
         '-1001234567890',
         'Group message',
+        { parse_mode: 'Markdown' },
       );
     });
 
@@ -725,11 +744,13 @@ describe('TelegramChannel', () => {
         1,
         '100200300',
         'x'.repeat(4096),
+        { parse_mode: 'Markdown' },
       );
       expect(currentBot().api.sendMessage).toHaveBeenNthCalledWith(
         2,
         '100200300',
         'x'.repeat(904),
+        { parse_mode: 'Markdown' },
       );
     });
 
@@ -913,6 +934,158 @@ describe('TelegramChannel', () => {
     it('has name "telegram"', () => {
       const channel = new TelegramChannel('test-token', createTestOpts());
       expect(channel.name).toBe('telegram');
+    });
+  });
+
+  // --- sendMessageWithId ---
+
+  describe('sendMessageWithId', () => {
+    it('returns message_id as string', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const id = await channel.sendMessageWithId('tg:100200300', 'Hello');
+
+      expect(id).toBe('42');
+      expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
+        '100200300',
+        'Hello',
+        { parse_mode: 'Markdown' },
+      );
+    });
+
+    it('returns undefined when bot is not initialized', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+
+      const id = await channel.sendMessageWithId('tg:100200300', 'No bot');
+
+      expect(id).toBeUndefined();
+    });
+
+    it('truncates text to 4096 chars', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const longText = 'a'.repeat(5000);
+      await channel.sendMessageWithId('tg:100200300', longText);
+
+      const sentText = currentBot().api.sendMessage.mock.calls[0][1];
+      expect(sentText.length).toBe(4096);
+    });
+
+    it('falls back to plain text on format error', async () => {
+      const { GrammyError } = await import('grammy');
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.sendMessage
+        .mockRejectedValueOnce(new GrammyError('Bad format', { ok: false, error_code: 400, description: 'Bad Request: can\'t parse' }, 'sendMessage', {}))
+        .mockResolvedValueOnce({ message_id: 99 });
+
+      const id = await channel.sendMessageWithId('tg:100200300', 'bad *markdown');
+
+      expect(id).toBe('99');
+      expect(currentBot().api.sendMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it('returns undefined on non-format error', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.sendMessage.mockRejectedValueOnce(new Error('Network error'));
+
+      const id = await channel.sendMessageWithId('tg:100200300', 'fail');
+
+      expect(id).toBeUndefined();
+    });
+  });
+
+  // --- editMessage ---
+
+  describe('editMessage', () => {
+    it('edits message via bot API', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const result = await channel.editMessage('tg:100200300', '42', 'Updated text');
+
+      expect(result).toBe(true);
+      expect(currentBot().api.editMessageText).toHaveBeenCalledWith(
+        '100200300',
+        42,
+        'Updated text',
+        { parse_mode: 'Markdown' },
+      );
+    });
+
+    it('returns false when bot is not initialized', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+
+      const result = await channel.editMessage('tg:100200300', '42', 'No bot');
+
+      expect(result).toBe(false);
+    });
+
+    it('truncates text to 4096 chars', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const longText = 'b'.repeat(5000);
+      await channel.editMessage('tg:100200300', '42', longText);
+
+      const sentText = currentBot().api.editMessageText.mock.calls[0][2];
+      expect(sentText.length).toBe(4096);
+    });
+
+    it('returns true on "message is not modified" error', async () => {
+      const { GrammyError } = await import('grammy');
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.editMessageText.mockRejectedValueOnce(
+        new GrammyError('Bad Request', { ok: false, error_code: 400, description: 'Bad Request: message is not modified' }, 'editMessageText', {}),
+      );
+
+      const result = await channel.editMessage('tg:100200300', '42', 'Same text');
+
+      expect(result).toBe(true);
+    });
+
+    it('falls back to plain text on format error', async () => {
+      const { GrammyError } = await import('grammy');
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.editMessageText
+        .mockRejectedValueOnce(new GrammyError('Bad format', { ok: false, error_code: 400, description: 'Bad Request: can\'t parse' }, 'editMessageText', {}))
+        .mockResolvedValueOnce(undefined);
+
+      const result = await channel.editMessage('tg:100200300', '42', 'bad *markdown');
+
+      expect(result).toBe(true);
+      expect(currentBot().api.editMessageText).toHaveBeenCalledTimes(2);
+    });
+
+    it('returns false on non-recoverable error', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.editMessageText.mockRejectedValueOnce(new Error('Network error'));
+
+      const result = await channel.editMessage('tg:100200300', '42', 'fail');
+
+      expect(result).toBe(false);
     });
   });
 });

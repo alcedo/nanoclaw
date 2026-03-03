@@ -192,6 +192,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let streamingError: string | undefined;
   let outputSentToUser = false;
 
+  // Edit-in-place streaming state
+  const canStream = typeof channel.sendMessageWithId === 'function' && typeof channel.editMessage === 'function';
+  let streamMsgId: string | undefined;
+  let streamMsgText = '';
+  const MAX_MSG_LENGTH = 4096;
+
   // Heartbeat: if no output after HEARTBEAT_INTERVAL, let the user know we're still working.
   // Cap at 3 messages to avoid spamming on very long requests.
   let heartbeatCount = 0;
@@ -201,7 +207,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       heartbeatCount++;
       const elapsed = Math.round((heartbeatCount * HEARTBEAT_INTERVAL) / 1000);
       try {
-        await channel.sendMessage(chatJid, `_Still working... (${elapsed}s)_`);
+        if (canStream && !streamMsgId) {
+          streamMsgId = await channel.sendMessageWithId!(chatJid, `_Still working... (${elapsed}s)_`);
+          streamMsgText = `_Still working... (${elapsed}s)_`;
+        } else {
+          await channel.sendMessage(chatJid, `_Still working... (${elapsed}s)_`);
+        }
       } catch { /* non-fatal */ }
     }
   }, HEARTBEAT_INTERVAL);
@@ -217,7 +228,41 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        if (canStream) {
+          if (streamMsgId) {
+            // We have a tracked message — try to edit it
+            const newText = outputSentToUser ? streamMsgText + '\n\n' + text : text;
+            if (newText.length <= MAX_MSG_LENGTH) {
+              const edited = await channel.editMessage!(chatJid, streamMsgId, newText);
+              if (edited) {
+                streamMsgText = newText;
+              } else {
+                // Edit failed — fall back to new message
+                const newId = await channel.sendMessageWithId!(chatJid, text);
+                if (newId) {
+                  streamMsgId = newId;
+                  streamMsgText = text;
+                }
+              }
+            } else {
+              // Would exceed limit — send new message and track it
+              const newId = await channel.sendMessageWithId!(chatJid, text);
+              if (newId) {
+                streamMsgId = newId;
+                streamMsgText = text;
+              }
+            }
+          } else {
+            // No tracked message yet — send first one with ID
+            const newId = await channel.sendMessageWithId!(chatJid, text);
+            if (newId) {
+              streamMsgId = newId;
+              streamMsgText = text;
+            }
+          }
+        } else {
+          await channel.sendMessage(chatJid, text);
+        }
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)

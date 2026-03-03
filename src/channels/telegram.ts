@@ -304,6 +304,69 @@ export class TelegramChannel implements Channel {
     }
   }
 
+  async sendMessageWithId(jid: string, text: string): Promise<string | undefined> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return undefined;
+    }
+
+    const numericId = jid.replace(/^tg:/, '');
+    const truncated = text.slice(0, 4096);
+    const processed = this.preprocessMarkdown(truncated);
+
+    try {
+      let msg;
+      try {
+        msg = await this.bot.api.sendMessage(numericId, processed, { parse_mode: 'Markdown' });
+      } catch (fmtErr) {
+        const isBadFormat = fmtErr instanceof GrammyError && fmtErr.error_code === 400;
+        if (isBadFormat) {
+          msg = await this.bot.api.sendMessage(numericId, truncated);
+        } else {
+          throw fmtErr;
+        }
+      }
+      return msg.message_id.toString();
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to send Telegram message with ID');
+      return undefined;
+    }
+  }
+
+  async editMessage(jid: string, messageId: string, text: string): Promise<boolean> {
+    if (!this.bot) return false;
+
+    const numericId = jid.replace(/^tg:/, '');
+    const truncated = text.slice(0, 4096);
+    const processed = this.preprocessMarkdown(truncated);
+
+    try {
+      try {
+        await this.bot.api.editMessageText(numericId, Number(messageId), processed, { parse_mode: 'Markdown' });
+      } catch (fmtErr) {
+        const isBadFormat = fmtErr instanceof GrammyError && fmtErr.error_code === 400;
+        if (isBadFormat) {
+          // Check if it's "message is not modified" — that's fine
+          if ((fmtErr as GrammyError).description?.includes('message is not modified')) {
+            return true;
+          }
+          // Otherwise try plain text
+          await this.bot.api.editMessageText(numericId, Number(messageId), truncated);
+        } else {
+          throw fmtErr;
+        }
+      }
+      return true;
+    } catch (err) {
+      // "message is not modified" is not a real failure
+      if (err instanceof GrammyError && err.description?.includes('message is not modified')) {
+        return true;
+      }
+      logger.warn({ jid, messageId, err }, 'Failed to edit Telegram message');
+      return false;
+    }
+  }
+
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
     if (!this.bot || !isTyping) return;
     try {
