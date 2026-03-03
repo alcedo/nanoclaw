@@ -9,6 +9,7 @@ import {
   GROUPS_DIR,
   HEARTBEAT_INTERVAL,
   IDLE_TIMEOUT,
+  LOG_RETENTION_DAYS,
   POLL_INTERVAL,
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_ONLY,
@@ -188,6 +189,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
+  let streamingError: string | undefined;
   let outputSentToUser = false;
 
   // Heartbeat: if no output after HEARTBEAT_INTERVAL, let the user know we're still working.
@@ -224,6 +226,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
     if (result.status === 'error') {
       hadError = true;
+      if (result.error) streamingError = result.error;
     }
   });
 
@@ -240,7 +243,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
       return true;
     }
-    const reason = output !== 'success' ? output : 'Unknown error';
+    const reason = output !== 'success' ? output : (streamingError || 'Unknown error');
 
     // Context limit: clear the session so the next message starts fresh
     if (reason.includes('context limit') || reason.includes('Model context limit')) {
@@ -274,7 +277,7 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
-): Promise<'success' | 'error'> {
+): Promise<'success' | string> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
 
@@ -553,7 +556,6 @@ async function main(): Promise<void> {
     logger.fatal('No channels connected');
     process.exit(1);
   }
-  }
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
@@ -615,7 +617,7 @@ async function main(): Promise<void> {
   // Only kills containers NOT currently tracked by the queue.
   setInterval(() => {
     const activeNames = queue.getActiveContainerNames();
-    cleanupOrphans(activeNames);
+    cleanupOrphans();
   }, DOCKER_WATCHDOG_INTERVAL);
 
   // Prune old container logs daily to prevent disk fill
